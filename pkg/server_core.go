@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -92,6 +93,30 @@ func (s Server) Connect(_ context.Context, r *Registration) (*AuthToken, error) 
 // (when you initially receive it, it will have the name of the recipient instead).
 // TODO: Implement `Send`. If any errors occur, return any error message you'd like.
 func (s Server) Send(ctx context.Context, msg *ChatMessage) (*Success, error) {
+	sender, ok := ctx.Value("username").(string)
+	if !ok {
+		return &Success{Ok: false}, errors.New("Could not extract username from context")
+	}
+
+	// Save recipient BEFORE overwriting msg.User
+	recipient := msg.User
+
+	// Look up recipient's inbox using ORIGINAL value
+	inbox, ok := s.Inboxes[recipient]
+	if !ok {
+		return &Success{Ok: false}, errors.New("Target user does not exist")
+	}
+
+	// NOW replace User field with sender's name as required by spec
+	msg.User = sender
+
+	// Non-blocking delivery to recipient's inbox
+	select {
+	case inbox <- msg:
+		return &Success{Ok: true}, nil
+	default:
+		return &Success{Ok: false}, errors.New("Target user's inbox is full")
+	}
 }
 
 // Implementation of the Fetch method defined in our `.proto` file.
@@ -102,6 +127,33 @@ func (s Server) Send(ctx context.Context, msg *ChatMessage) (*Success, error) {
 //
 // TODO: Implement Fetch. If any errors occur, return any error message you'd like.
 func (s Server) Fetch(ctx context.Context, _ *Empty) (*ChatMessages, error) {
+	user, ok := ctx.Value("username").(string)
+	if !ok {
+		return nil, errors.New("Could not extract username from context")
+	}
+	inbox, ok := s.Inboxes[user]
+	if !ok {
+		return nil, errors.New("User inbox does not exist")
+	}
+
+	messages := make([]*ChatMessage, 0, BATCH_SIZE)
+
+	// Single efficient loop with early termination
+	for i := 0; i < BATCH_SIZE; i++ {
+		select {
+		case msg, open := <-inbox:
+			if !open {
+				// Inbox closed (user disconnected)
+				return &ChatMessages{Messages: messages}, nil
+			}
+			messages = append(messages, msg)
+		default:
+			// No more immediately available messages - exit immediately
+			return &ChatMessages{Messages: messages}, nil
+		}
+	}
+
+	return &ChatMessages{Messages: messages}, nil
 }
 
 // Implementation of the List method defined in our `.proto` file.
